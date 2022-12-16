@@ -1,3 +1,4 @@
+use core::sync::atomic::{AtomicU32, Ordering};
 use cortex_m::interrupt;
 use embedded_hal_nb::nb;
 use rp2040_hal::pwm::{FreeRunning, Slice, SliceId};
@@ -6,6 +7,7 @@ use rp2040_monotonic::fugit;
 pub struct PwmTimer<const TIMER_HZ: u32, T: SliceId> {
     pwm: Slice<T, FreeRunning>,
     end_time: Option<fugit::TimerInstantU32<TIMER_HZ>>,
+    overflows: u32,
 }
 
 impl<const TIMER_HZ: u32, T: SliceId> PwmTimer<TIMER_HZ, T> {
@@ -28,31 +30,29 @@ impl<const TIMER_HZ: u32, T: SliceId> PwmTimer<TIMER_HZ, T> {
             pwm.set_div_frac(0);
         }
 
+        pwm.enable_interrupt();
+
         Self {
             pwm: pwm,
             end_time: None,
+            overflows: 0,
         }
     }
 
     pub fn ticks(&mut self) -> u64 {
-        static mut SYSTICK_OVERFLOWS: u32 = 0;
-        static mut OLD_SYSTICK: u16 = 0;
-
         interrupt::free(|_| {
-            // Safety: These static mut variables are accessed in an interrupt free section.
-            let (overflows, last_cnt) = unsafe { (&mut SYSTICK_OVERFLOWS, &mut OLD_SYSTICK) };
-
             let cyccnt = self.pwm.get_counter();
-
-            if cyccnt <= *last_cnt {
-                *overflows += 1;
-            }
-
-            let ticks = (*overflows as u64) << 16 | (cyccnt as u64);
-            *last_cnt = cyccnt;
+            let ticks = (self.overflows as u64) << 16 | (cyccnt as u64);
 
             ticks
         })
+    }
+
+    pub fn on_wrap(&mut self) {
+        if self.pwm.has_overflown() {
+            self.overflows += 1;
+        }
+        self.pwm.clear_interrupt();
     }
 }
 
