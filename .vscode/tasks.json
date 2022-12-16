@@ -30,9 +30,24 @@
             ],
             "group": {
                 "kind": "build",
-                "isDefault": true
+                "isDefault": false
             },
             "dependsOn": "Cargo build"
+        },
+        {
+            "label": "Cargo run",
+            "type": "shell",
+            "command": "cargo",
+            "args": [
+                "embed"
+            ],
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
         }
     ]
 }
