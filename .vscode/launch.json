@@ -2,32 +2,35 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Pico Debug",
-            "cwd": "${workspaceRoot}",
-            "executable": "${workspaceFolder}/target/thumbv6m-none-eabi/debug/rp2040-project-template",
+            "type": "probe-rs-debug",
             "request": "launch",
-            "type": "cortex-debug",
-            "servertype": "openocd",
-            // This may need to be arm-none-eabi-gdb depending on your system
-            "gdbPath": "arm-none-eabi-gdb",
-            "device": "RP2040",
-            "configFiles": [
-                "interface/picoprobe.cfg",
-                "target/rp2040.cfg"
+            "name": "probe-rs Test",
+            "cwd": "${workspaceFolder}",
+            "speed": 20000,
+            "runtimeExecutable": "probe-rs-debugger",
+            "runtimeArgs": [
+                "debug"
             ],
-            "svdFile": "C:/Users/nick/Documents/MCU/pico-sdk/src/rp2040/hardware_regs/rp2040.svd",
-            "runToEntryPoint": "main",
-            "preLaunchTask": "Build binary",
-            // Work around for stopping at main on restart
-            "postRestartCommands": [
-                "break main",
-                "continue"
-            ]
+            "connectUnderReset": false,
+            "chip": "RP2040",
+            "flashingConfig": {
+                "flashingEnabled": true,
+                "resetAfterFlashing": true,
+                "haltAfterReset": false
+            },
+            "coreConfigs": [
+                {
+                    "coreIndex": 0,
+                    "programBinary": "./target/thumbv6m-none-eabi/debug/picoc3-audio-stream"
+                }
+            ],
+            "consoleLogLevel": "Info",
+            "preLaunchTask": "Cargo build"
         },
         {
-            "name": "Pico Debug (No Break)",
+            "name": "Pico Debug",
             "cwd": "${workspaceRoot}",
-            "executable": "${workspaceFolder}/target/thumbv6m-none-eabi/debug/rp2040-project-template",
+            "executable": "${workspaceFolder}/target/thumbv6m-none-eabi/debug/picoc3-audio-stream",
             "request": "launch",
             "type": "cortex-debug",
             "servertype": "openocd",
@@ -35,19 +38,32 @@
             "gdbPath": "arm-none-eabi-gdb",
             "device": "RP2040",
             "configFiles": [
-                "interface/picoprobe.cfg",
+                "interface/cmsis-dap.cfg",
                 "target/rp2040.cfg"
             ],
-            "svdFile": "C:/Users/nick/Documents/MCU/pico-sdk/src/rp2040/hardware_regs/rp2040.svd",
+            "svdFile": "C:/Users/nick/source/mcu/pico-sdk/src/rp2040/hardware_regs/rp2040.svd",
+            //"runToEntryPoint": "main",
             "preLaunchTask": "Build binary",
-            "preLaunchCommands": [
-                "monitor arm semihosting enable"
-            ],
             // Work around for stopping at main on restart
             "postRestartCommands": [
                 "break main",
                 "continue"
-            ]
-        }
+            ],
+            "openOCDLaunchCommands": [
+                "adapter speed 20000"
+            ],
+            "rttConfig": {
+                "enabled": false,
+                "address": "auto",
+                "clearSearch": false,
+                "decoders": [
+                    {
+                        "label": "",
+                        "port": 0,
+                        "type": "console"
+                    }
+                ]
+            }
+        },
     ]
 }

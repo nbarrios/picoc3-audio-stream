@@ -1,62 +1,71 @@
 use core::sync::atomic::{AtomicU32, Ordering};
-use cortex_m::interrupt;
 use embedded_hal_nb::nb;
 use rp2040_hal::pwm::{FreeRunning, Slice, SliceId};
 use rp2040_monotonic::fugit;
 
-pub struct PwmTimer<const TIMER_HZ: u32, T: SliceId> {
+const TIMER_HZ: u32 = 1000;
+
+pub struct PwmTimerDriver<'a, T: SliceId> {
     pwm: Slice<T, FreeRunning>,
-    end_time: Option<fugit::TimerInstantU32<TIMER_HZ>>,
-    overflows: u32,
+    ticks: &'a AtomicU32,
 }
 
-impl<const TIMER_HZ: u32, T: SliceId> PwmTimer<TIMER_HZ, T> {
-    pub fn new(mut pwm: Slice<T, FreeRunning>, periph_timer_freq: u32) -> Self {
+impl<'a, T: SliceId> PwmTimerDriver<'a, T> {
+    pub fn new(
+        mut pwm: Slice<T, FreeRunning>,
+        ticks: &'a AtomicU32,
+        periph_timer_freq: u32,
+    ) -> Self {
         pwm.enable();
         pwm.clr_ph_correct();
 
-        let mut div_int: u32 = periph_timer_freq / TIMER_HZ;
-        if div_int > 255 {
-            div_int = 255;
-        }
+        let div_int: u32 = periph_timer_freq / (TIMER_HZ * TIMER_HZ);
+        assert!(div_int < 256);
         pwm.set_div_int(div_int as u8);
 
-        let frac_mod = periph_timer_freq % TIMER_HZ;
+        let frac_mod = periph_timer_freq % (TIMER_HZ * TIMER_HZ);
         if frac_mod > 0 {
-            let frac_mul = TIMER_HZ / frac_mod;
+            let frac_mul = (TIMER_HZ * TIMER_HZ) / frac_mod;
             let div_frac = 0xFFFF / frac_mul;
             pwm.set_div_frac(div_frac as u8);
         } else {
             pwm.set_div_frac(0);
         }
 
+        pwm.set_top(TIMER_HZ as u16);
         pwm.enable_interrupt();
 
-        Self {
-            pwm: pwm,
-            end_time: None,
-            overflows: 0,
-        }
-    }
-
-    pub fn ticks(&mut self) -> u64 {
-        interrupt::free(|_| {
-            let cyccnt = self.pwm.get_counter();
-            let ticks = (self.overflows as u64) << 16 | (cyccnt as u64);
-
-            ticks
-        })
+        Self { pwm, ticks }
     }
 
     pub fn on_wrap(&mut self) {
         if self.pwm.has_overflown() {
-            self.overflows += 1;
+            let t = self.ticks.load(Ordering::Relaxed);
+            self.ticks.store(t + 1, Ordering::Relaxed);
+            self.pwm.clear_interrupt();
         }
-        self.pwm.clear_interrupt();
     }
 }
 
-impl<const TIMER_HZ: u32, T: SliceId> fugit_timer::Timer<TIMER_HZ> for PwmTimer<TIMER_HZ, T> {
+pub struct PwmTimer<'a> {
+    ticks: &'a AtomicU32,
+    end_time: Option<fugit::TimerInstantU32<TIMER_HZ>>,
+}
+
+impl<'a> PwmTimer<'a> {
+    pub fn new(ticks: &'a AtomicU32) -> Self {
+        Self {
+            ticks: ticks,
+            end_time: None,
+        }
+    }
+
+    pub fn ticks(&mut self) -> u64 {
+        self.ticks.load(Ordering::Relaxed) as u64
+    }
+}
+
+impl<'a> fugit_timer::Timer<TIMER_HZ> for PwmTimer<'a> {
     type Error = core::convert::Infallible;
 
     fn now(&mut self) -> fugit::TimerInstantU32<TIMER_HZ> {

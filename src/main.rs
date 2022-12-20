@@ -10,11 +10,12 @@ use panic_probe as _;
 pub mod bsp;
 pub mod pwm_timer;
 
-#[rtic::app(device = crate::bsp::hal::pac, peripherals = true, dispatchers = [TIMER_IRQ_2, TIMER_IRQ_3])]
+#[rtic::app(device = crate::bsp::hal::pac, peripherals = true, dispatchers = [PIO0_IRQ_0, PIO0_IRQ_1])]
 mod app {
-    use crate::{bsp::hal, pwm_timer::PwmTimer};
+    use crate::bsp::hal;
+    use crate::pwm_timer::{PwmTimer, PwmTimerDriver};
     use core::convert::TryInto;
-    use core::fmt::Write;
+    use core::sync::atomic::{AtomicU32};
     use defmt::info;
     use defmt_rtt as _;
     use display_interface_spi::SPIInterface;
@@ -25,9 +26,7 @@ mod app {
         primitives::Rectangle,
     };
     use embedded_hal::digital::v2::OutputPin;
-    use embedded_hal::serial::Read;
     use embedded_hal::adc::OneShot;
-    use embedded_hal_nb::serial::{Write as NbWrite};
     use embedded_text::{
         alignment::HorizontalAlignment,
         style::{HeightMode, TextBoxStyleBuilder},
@@ -50,7 +49,6 @@ mod app {
         uart::{Enabled, UartPeripheral, UartConfig, DataBits, StopBits, Reader, Writer},
         watchdog::Watchdog,
     };
-    use heapless::spsc::{Consumer, Producer, Queue};
     use profont::PROFONT_10_POINT;
     use st7789::ST7789;
     use atat::{Client, ClientBuilder, Queues, bbqueue::BBBuffer, IngressManager, AtDigester};
@@ -94,9 +92,14 @@ mod app {
         esp32_uart_rx: Reader<UART1, Uart1Pins>,
         adc: hal::Adc,
         adc_pin_1: Pin<Gpio27, Input<Floating>>,
+        pwm1_timer_driver: PwmTimerDriver<'static, Pwm6>,
+        pwm2_timer_driver: PwmTimerDriver<'static, Pwm7>,
+        adapter: Adapter<
+            Client<Writer<UART1, (Pin<Gpio8, Function<Uart>>, Pin<Gpio9, Function<Uart>>)>, PwmTimer<'static>, 1000, RES_CAPACITY_BYTES, URC_CAPACITY_BYTES>,
+            PwmTimer<'static>, 1000, TX_BUFFER_BYTES, RX_BUFFER_BYTES>
     }
 
-    #[init(local = [rx_q: Queue<u8, 256> = Queue::new(), tx_q: Queue<u8, 256> = Queue::new()])]
+    #[init(local = [])]
     fn init(cx: init::Context) -> (Shared, Local, init::Monotonics) {
         unsafe {
             crate::bsp::hal::sio::spinlock_reset();
@@ -126,13 +129,15 @@ mod app {
 
         let pwm_slices = Slices::new(cx.device.PWM, &mut resets);
 
-        let pwm1 = pwm_slices.pwm6;
-        let pwm_timer1 = PwmTimer::<1_000_000, Pwm6>::new(
-            pwm1, clocks.peripheral_clock.freq().raw());
+        static PWM1_OVERFLOWS: AtomicU32 = AtomicU32::new(0);
+        let pwm1_timer_driver =
+            PwmTimerDriver::new(pwm_slices.pwm6, &PWM1_OVERFLOWS, clocks.peripheral_clock.freq().raw());
+        let pwm_timer1 = PwmTimer::new(&PWM1_OVERFLOWS);
 
-        let pwm2 = pwm_slices.pwm7;
-        let pwm_timer2 = PwmTimer::<1_000_000, Pwm7>::new(
-            pwm2, clocks.peripheral_clock.freq().raw());
+        static PWM2_OVERFLOWS: AtomicU32 = AtomicU32::new(0);
+        let pwm2_timer_driver =
+            PwmTimerDriver::new(pwm_slices.pwm7, &PWM2_OVERFLOWS, clocks.peripheral_clock.freq().raw());
+        let pwm_timer2 = PwmTimer::new(&PWM2_OVERFLOWS);
 
         let pins = crate::bsp::Pins::new(
             cx.device.IO_BANK0,
@@ -146,7 +151,12 @@ mod app {
             pins.gpio8.into_mode::<gpio::FunctionUart>(),
             pins.gpio9.into_mode::<gpio::FunctionUart>(),
         );
-        let uart1 = uart_setup(uart_pins, cx.device.UART1, &clocks, &mut resets);
+        let mut uart1 = UartPeripheral::new(cx.device.UART1, uart_pins, &mut resets)
+            .enable(
+                UartConfig::new(115200.Hz(), DataBits::Eight, None, StopBits::One),
+                clocks.peripheral_clock.freq()
+            ).unwrap();
+        uart1.enable_rx_interrupt();
         let (rx, tx) = uart1.split();
 
         //UART0 (PICOPROBE)
@@ -196,11 +206,7 @@ mod app {
         )
         .build(queues);
 
-        let mut adapter: Adapter<_, _, 1_000_000, TX_BUFFER_BYTES, RX_BUFFER_BYTES> = Adapter::new(client, pwm_timer2);
-
-        info!("Joining WiFi...");
-        let state = adapter.join("Home 1", "1234554321").unwrap();
-        info!("WiFi Connection State: {}", state.connected);
+        let adapter: Adapter<_, _, 1_000, TX_BUFFER_BYTES, RX_BUFFER_BYTES> = Adapter::new(client, pwm_timer2);
 
         //write_serial::spawn_after(1_u64.secs()).unwrap();
         //read_serial::spawn_after(1_u64.secs()).unwrap();
@@ -208,6 +214,8 @@ mod app {
         //read_adc::spawn_after(1_u64.secs()).unwrap();
         //led_pin.set_high().unwrap();
         //led_pin.set_low().unwrap();
+
+        wifi_connect::spawn().unwrap();
 
         (
             Shared {
@@ -219,6 +227,9 @@ mod app {
                 esp32_uart_rx: rx,
                 adc,
                 adc_pin_1,
+                pwm1_timer_driver,
+                pwm2_timer_driver,
+                adapter
             },
             init::Monotonics(mono),
         )
@@ -227,60 +238,24 @@ mod app {
     #[idle]
     fn idle(_: idle::Context) -> ! {
         loop {
-            cortex_m::asm::nop();
+            cortex_m::asm::wfi();
         }
+    }
+
+    #[task(local = [adapter])]
+    fn wifi_connect(ctx: wifi_connect::Context) {
+        info!("Joining WiFi...");
+        let state = ctx.local.adapter.join("Home 1", "1234554321").unwrap();
+        info!("WiFi Connection State: {}", state.connected);
     }
 
     #[task(shared = [uart0], local = [adc, adc_pin_1])]
     fn read_adc(cx: read_adc::Context) {
         let adc_count: u16 = cx.local.adc.read(cx.local.adc_pin_1).unwrap();
+        info!("ADC: {}", adc_count);
 
-        //let _res = write!(cx.shared.uart0, "ADC: {}\n", adc_count);
-        read_adc::spawn_after(1_u64.secs()).unwrap();
+        read_adc::spawn_after(30_u64.secs()).unwrap();
     }
-
-    // #[task(local = [uart_tx_write, index: usize = 0], shared = [uart0])]
-    // fn write_serial(cx: write_serial::Context) {
-    //     let commands = [
-    //         "AT+GMR\r\n",
-    //         "AT+SYSSTORE=0\r\n",
-    //         "AT+CWMODE=1,0\r\n",
-    //         "AT+CWSTATE?\r\n",
-    //         "AT+CWJAP=\"Home 1\",\"1234554321\"\r\n",
-    //         "AT+CIPSTA?\r\n"
-    //     ];
-
-    //     if *cx.local.index < commands.len() {
-    //         write!(cx.shared.uart0, "{}", commands[*cx.local.index]).unwrap();
-
-    //         let at_gmr = commands[*cx.local.index].as_bytes();
-    //         for byte in at_gmr.iter() {
-    //             cx.local.uart_tx_write.enqueue(*byte).unwrap();
-    //         }
-    //         *cx.local.index += 1;
-    //         write_serial::spawn_after(3.secs()).unwrap();
-
-    //         unsafe {
-    //             hal::pac::NVIC::unmask(Interrupt::UART1_IRQ);
-    //         }
-    //         rtic::pend(Interrupt::UART1_IRQ);
-    //     }
-    // }
-
-    // #[task(shared = [uart0], local = [uart_rx_read])]
-    // fn read_serial(cx: read_serial::Context) {
-    //     let uart0 = cx.shared.uart0;
-    //     let rx_q = cx.local.uart_rx_read;
-
-    //     while let Some(byte) = rx_q.peek().cloned() {
-    //         if uart0.write(byte).is_ok() {
-    //             rx_q.dequeue();
-    //         } else {
-    //             break;
-    //         }
-    //     }
-    //     read_serial::spawn_after(1.millis()).unwrap();
-    // }
 
     #[task(local = [display,
                     index: usize = 0, 
@@ -289,7 +264,7 @@ mod app {
             shared = [uart0]
           )]
     fn update_display(cx: update_display::Context) {
-        let mut buffer_updated = false;
+        let buffer_updated = false;
 
         // while let Some(byte) = cx.local.uart_rx_read.dequeue() {
         //     cx.local.buffer[*cx.local.index] = byte;
@@ -332,21 +307,30 @@ mod app {
         update_display::spawn_after(250_u64.millis()).unwrap();
     }
 
-    #[task(binds = UART1_IRQ, shared = [ingress], local = [esp32_uart_rx])]
+    #[task(priority = 2, binds = UART1_IRQ, shared = [ingress], local = [esp32_uart_rx])]
     fn uart1(mut cx: uart1::Context) {
         static mut BUFFER: [u8; 64] = [0; 64];
 
-        info!("UART1 Interrupt");
         let reader = cx.local.esp32_uart_rx;
 
         cx.shared.ingress.lock(|ingress| {
             unsafe {
                 while let Ok(bytes_read) = reader.read_raw(&mut BUFFER) {
-                    info!("RX Bytes Read: {}", bytes_read);
+                    use core::str::from_utf8_unchecked;
+                    let str = from_utf8_unchecked(&BUFFER[..bytes_read]);
+                    info!("RX: {}", str);
                     ingress.write(&BUFFER[..bytes_read]);
+                    ingress.digest();
+                    ingress.digest();
                 }
             }
         });
+    }
+
+    #[task(priority = 2, binds = PWM_IRQ_WRAP, local = [pwm1_timer_driver, pwm2_timer_driver])]
+    fn pwm_wrap(ctx: pwm_wrap::Context) {
+        ctx.local.pwm1_timer_driver.on_wrap();
+        ctx.local.pwm2_timer_driver.on_wrap();
     }
 
     fn tft_display_setup(
@@ -387,25 +371,6 @@ mod app {
             .set_orientation(st7789::Orientation::Landscape)
             .unwrap();
         display
-    }
-
-    fn uart_setup(
-        uart_pins: Uart1Pins,
-        device: pac::UART1,
-        clocks: &ClocksManager,
-        resets: &mut pac::RESETS,
-    ) -> UartPeripheral<Enabled, hal::pac::UART1, Uart1Pins> {
-        let mut uart = UartPeripheral::new(device, uart_pins, resets)
-            .enable(
-                UartConfig::default(),
-                clocks.peripheral_clock.freq(),
-            )
-            .unwrap();
-
-        uart.enable_rx_interrupt();
-        //uart.enable_tx_interrupt();
-
-        uart
     }
 }
 

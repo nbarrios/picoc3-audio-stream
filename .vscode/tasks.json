@@ -22,8 +22,8 @@
             "args": [
                 "--output-target",
                 "binary",
-                "./target/thumbv6m-none-eabi/debug/rp2040-project-template",
-                "./target/thumbv6m-none-eabi/debug/rp2040-project-template.bin"
+                "./target/thumbv6m-none-eabi/debug/picoc3-audio-stream",
+                "./target/thumbv6m-none-eabi/debug/picoc3-audio-stream.bin"
             ],
             "problemMatcher": [
                 "$rustc"
@@ -47,6 +47,11 @@
             "group": {
                 "kind": "build",
                 "isDefault": true
+            },
+            "options": {
+                "env": {
+                    "DEFMT_LOG": "debug"
+                }
             }
         }
     ]
