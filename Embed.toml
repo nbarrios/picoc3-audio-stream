@@ -13,6 +13,9 @@ speed = 20000
 [default.flashing]
 enabled = true
 
+[noflash.flashing]
+enabled = false
+
 [default.reset]
 enabled = true
 halt_afterwards = false
@@ -31,7 +34,7 @@ channels = [
 ]
 timeout = 3000
 show_timestamps = true
-log_enabled = false
+log_enabled = true
 log_path = "./logs"
 
 [default.gdb]

@@ -8,15 +8,18 @@ use defmt_rtt as _;
 use panic_probe as _;
 
 pub mod bsp;
-pub mod pwm_timer;
+mod adc;
 
 #[rtic::app(device = crate::bsp::hal::pac, peripherals = true, dispatchers = [PIO0_IRQ_0, PIO0_IRQ_1])]
 mod app {
     use crate::bsp::hal;
-    use crate::pwm_timer::{PwmTimer, PwmTimerDriver};
+    use crate::adc;
+    use esp_at_nal::wifi::JoinError;
+    use rp2040_pwm_timer::{ExtDrivenTimer, PwmTimerDriver};
     use core::convert::TryInto;
     use core::sync::atomic::{AtomicU32};
-    use defmt::info;
+    use core::str::FromStr;
+    use defmt::{info, error};
     use defmt_rtt as _;
     use display_interface_spi::SPIInterface;
     use embedded_graphics::{
@@ -26,7 +29,6 @@ mod app {
         primitives::Rectangle,
     };
     use embedded_hal::digital::v2::OutputPin;
-    use embedded_hal::adc::OneShot;
     use embedded_text::{
         alignment::HorizontalAlignment,
         style::{HeightMode, TextBoxStyleBuilder},
@@ -39,7 +41,7 @@ mod app {
         clocks::ClocksManager,
         clocks::{init_clocks_and_plls, Clock},
         gpio,
-        gpio::pin::bank0::{Gpio0, Gpio1, Gpio2, Gpio3, Gpio4, Gpio5, Gpio8, Gpio9, Gpio12, Gpio13, Gpio27},
+        gpio::pin::bank0::{Gpio0, Gpio1, Gpio2, Gpio3, Gpio4, Gpio5, Gpio8, Gpio9, Gpio10, Gpio11, Gpio12, Gpio13},
         gpio::{Output, Input, Pin, PullDown, PushPull, Floating},
         gpio::{Disabled, Function, Uart},
         pac::{self, UART1},
@@ -52,9 +54,11 @@ mod app {
     use profont::PROFONT_10_POINT;
     use st7789::ST7789;
     use atat::{Client, ClientBuilder, Queues, bbqueue::BBBuffer, IngressManager, AtDigester};
+    use embedded_nal::{SocketAddr, UdpClientStack};
     use esp_at_nal::{
         urc::URCMessages,
-        wifi::{Adapter, WifiAdapter}
+        wifi::{Adapter, WifiAdapter},
+        stack::Socket,    
     };
 
     #[monotonic(binds = TIMER_IRQ_0, default = true)]
@@ -67,7 +71,7 @@ mod app {
     >;
 
     type Uart0Pins = (Pin<Gpio12, Function<Uart>>, Pin<Gpio13, Function<Uart>>);
-    type Uart1Pins = (Pin<Gpio8, Function<Uart>>, Pin<Gpio9, Function<Uart>>);
+    type Uart1Pins = (Pin<Gpio8, Function<Uart>>, Pin<Gpio9, Function<Uart>>, Pin<Gpio10, Function<Uart>>, Pin<Gpio11, Function<Uart>>);
 
     const TX_BUFFER_BYTES: usize = 1024;
     const RX_BUFFER_BYTES: usize = 2048;
@@ -84,19 +88,23 @@ mod app {
         >,
         #[lock_free]
         uart0: UartPeripheral<Enabled, pac::UART0, Uart0Pins>,
+        #[lock_free]
+        adapter: Adapter<
+            Client<Writer<UART1, Uart1Pins>, ExtDrivenTimer<'static, 1000>, 1000, RES_CAPACITY_BYTES, URC_CAPACITY_BYTES>,
+            ExtDrivenTimer<'static, 1000>, 1000, TX_BUFFER_BYTES, RX_BUFFER_BYTES
+        >,
+        #[lock_free]
+        socket: Option<Socket>,
     }
 
     #[local]
     struct Local {
         display: ST7789<SPIIntType, Pin<Gpio0, Output<PushPull>>, Pin<Gpio4, Output<PushPull>>>,
         esp32_uart_rx: Reader<UART1, Uart1Pins>,
-        adc: hal::Adc,
-        adc_pin_1: Pin<Gpio27, Input<Floating>>,
+        adc: adc::DmaAdc,
+        //adc_pin_1: Pin<Gpio27, Input<Floating>>,
         pwm1_timer_driver: PwmTimerDriver<'static, Pwm6>,
         pwm2_timer_driver: PwmTimerDriver<'static, Pwm7>,
-        adapter: Adapter<
-            Client<Writer<UART1, (Pin<Gpio8, Function<Uart>>, Pin<Gpio9, Function<Uart>>)>, PwmTimer<'static>, 1000, RES_CAPACITY_BYTES, URC_CAPACITY_BYTES>,
-            PwmTimer<'static>, 1000, TX_BUFFER_BYTES, RX_BUFFER_BYTES>
     }
 
     #[init(local = [])]
@@ -132,12 +140,12 @@ mod app {
         static PWM1_OVERFLOWS: AtomicU32 = AtomicU32::new(0);
         let pwm1_timer_driver =
             PwmTimerDriver::new(pwm_slices.pwm6, &PWM1_OVERFLOWS, clocks.peripheral_clock.freq().raw());
-        let pwm_timer1 = PwmTimer::new(&PWM1_OVERFLOWS);
+        let pwm_timer1 = ExtDrivenTimer::new(&PWM1_OVERFLOWS);
 
         static PWM2_OVERFLOWS: AtomicU32 = AtomicU32::new(0);
         let pwm2_timer_driver =
             PwmTimerDriver::new(pwm_slices.pwm7, &PWM2_OVERFLOWS, clocks.peripheral_clock.freq().raw());
-        let pwm_timer2 = PwmTimer::new(&PWM2_OVERFLOWS);
+        let pwm_timer2 = ExtDrivenTimer::new(&PWM2_OVERFLOWS);
 
         let pins = crate::bsp::Pins::new(
             cx.device.IO_BANK0,
@@ -147,13 +155,15 @@ mod app {
         );
 
         //UART1 (ESP32-AT)
-        let uart_pins: Uart1Pins = (
+        let uart_pins = (
             pins.gpio8.into_mode::<gpio::FunctionUart>(),
             pins.gpio9.into_mode::<gpio::FunctionUart>(),
+            pins.gpio10.into_mode::<gpio::FunctionUart>(),
+            pins.gpio11.into_mode::<gpio::FunctionUart>(),
         );
         let mut uart1 = UartPeripheral::new(cx.device.UART1, uart_pins, &mut resets)
             .enable(
-                UartConfig::new(115200.Hz(), DataBits::Eight, None, StopBits::One),
+                UartConfig::new(1_000_000.Hz(), DataBits::Eight, None, StopBits::One),
                 clocks.peripheral_clock.freq()
             ).unwrap();
         uart1.enable_rx_interrupt();
@@ -172,8 +182,8 @@ mod app {
             ).unwrap();
 
         //ADC
-        let adc = hal::Adc::new(cx.device.ADC, &mut resets); 
-        let adc_pin_1 = pins.gpio27.into_floating_input();
+        pins.gpio27.into_floating_input();
+        let adc = adc::DmaAdc::new(cx.device.ADC, cx.device.DMA, &mut resets);
 
         //Display
         let mut display = tft_display_setup(
@@ -208,28 +218,23 @@ mod app {
 
         let adapter: Adapter<_, _, 1_000, TX_BUFFER_BYTES, RX_BUFFER_BYTES> = Adapter::new(client, pwm_timer2);
 
-        //write_serial::spawn_after(1_u64.secs()).unwrap();
-        //read_serial::spawn_after(1_u64.secs()).unwrap();
-        //update_display::spawn_after(250_u64.millis()).unwrap();
-        //read_adc::spawn_after(1_u64.secs()).unwrap();
-        //led_pin.set_high().unwrap();
-        //led_pin.set_low().unwrap();
-
-        wifi_connect::spawn().unwrap();
+        at_digest::spawn_after(500.millis()).unwrap();
+        restart_esp32::spawn_after(500.millis()).unwrap();
 
         (
             Shared {
                 ingress,
                 uart0,
+                adapter,
+                socket: None,
             },
             Local {
                 display,
                 esp32_uart_rx: rx,
                 adc,
-                adc_pin_1,
+                //adc_pin_1,
                 pwm1_timer_driver,
                 pwm2_timer_driver,
-                adapter
             },
             init::Monotonics(mono),
         )
@@ -242,19 +247,93 @@ mod app {
         }
     }
 
-    #[task(local = [adapter])]
-    fn wifi_connect(ctx: wifi_connect::Context) {
-        info!("Joining WiFi...");
-        let state = ctx.local.adapter.join("Home 1", "1234554321").unwrap();
-        info!("WiFi Connection State: {}", state.connected);
+    #[task(shared = [adapter])]
+    fn restart_esp32(ctx: restart_esp32::Context) {
+        let adapter = ctx.shared.adapter;
+        info!("Restarting ESP32 Module...");
+        if let Err(_) = adapter.restart() {
+            info!("Restart Failed, trying again...");
+            restart_esp32::spawn_after(1.secs()).unwrap();
+            return;
+        }
+        info!("Done");
+        wifi_connect::spawn_after(3.secs()).unwrap();
     }
 
-    #[task(shared = [uart0], local = [adc, adc_pin_1])]
-    fn read_adc(cx: read_adc::Context) {
-        let adc_count: u16 = cx.local.adc.read(cx.local.adc_pin_1).unwrap();
-        info!("ADC: {}", adc_count);
+    #[task(shared = [adapter, socket])]
+    fn wifi_connect(ctx: wifi_connect::Context) {
+        let adapter = ctx.shared.adapter;
 
-        read_adc::spawn_after(30_u64.secs()).unwrap();
+        let response = adapter.get_current_uart_config().unwrap();
+        info!("UART Config: {},{},{},{},{}", 
+            response.baudrate, response.databits, response.parity, response.stopbits, response.flow_control);
+
+        let mut state = adapter.get_join_status();
+        if !state.connected {
+            match adapter.join("Home 1", "1234554321") {
+                Ok(s) => {
+                    state = s;
+                },
+                Err(e) => {
+                    match e {
+                        JoinError::ConnectError(_) => info!("Connect Error"),
+                        JoinError::ModeError(_) => info!("Mode Error"),
+                        _ => info!("Unknown Join Error"),
+                    }
+                    info!("WiFI failed to join, retrying...");
+                    wifi_connect::spawn_after(3.secs()).unwrap();
+                    return;
+                }
+            }
+        }
+        info!("WiFi Connection State: {}", state.connected);
+
+        let address = adapter.get_address().unwrap();
+        if let Some(ipv4) = address.ipv4 {
+            info!("IP Address: {}", ipv4.octets());
+        }
+        if let Some(mac) = address.mac {
+            info!("MAC Address: {}", mac.as_str());
+        }
+
+        match adapter.socket() {
+            Ok(mut socket) => {
+                match adapter.connect(&mut socket, SocketAddr::from_str("192.168.1.184:5555").unwrap()) {
+                    Ok(_) => {
+                        info!("UDP connection successful (192.168.1.184:5555)");
+                        ctx.shared.socket.replace(socket);
+                        read_adc::spawn().unwrap();
+                    },
+                    Err(_e) => {
+                        error!("Connection error");
+                    }
+                };
+            },
+            Err(_) => error!("Socket error")
+        }
+    }
+
+    #[task(shared = [uart0, adapter, socket], local = [adc])]
+    fn read_adc(cx: read_adc::Context) {
+        //cx.local.adc.print_dma_control_status();
+
+        let adc_count = cx.local.adc.buffer_value();
+
+        let mut buffer = [0u8; 128];
+        let packet = picoc3_audio_stream::audio_packet::AudioPacket {
+            magic: *b"ADC",
+            values: adc_count
+        };
+
+        let len = minicbor::len(&packet);
+
+        minicbor::encode(&packet, buffer[..len].as_mut()).unwrap();
+
+        if let Err(_e) = cx.shared.adapter.send(cx.shared.socket.as_mut().unwrap(), &buffer[..len]) {
+            info!("Send failed");
+        }
+
+        read_adc::spawn_at(monotonics::now() + 100_u64.millis()).unwrap();
     }
 
     #[task(local = [display,
@@ -307,7 +386,7 @@ mod app {
         update_display::spawn_after(250_u64.millis()).unwrap();
     }
 
-    #[task(priority = 2, binds = UART1_IRQ, shared = [ingress], local = [esp32_uart_rx])]
+    #[task(priority = 3, binds = UART1_IRQ, shared = [ingress], local = [esp32_uart_rx])]
     fn uart1(mut cx: uart1::Context) {
         static mut BUFFER: [u8; 64] = [0; 64];
 
@@ -316,18 +395,22 @@ mod app {
         cx.shared.ingress.lock(|ingress| {
             unsafe {
                 while let Ok(bytes_read) = reader.read_raw(&mut BUFFER) {
-                    use core::str::from_utf8_unchecked;
-                    let str = from_utf8_unchecked(&BUFFER[..bytes_read]);
-                    info!("RX: {}", str);
                     ingress.write(&BUFFER[..bytes_read]);
-                    ingress.digest();
-                    ingress.digest();
                 }
             }
         });
     }
 
-    #[task(priority = 2, binds = PWM_IRQ_WRAP, local = [pwm1_timer_driver, pwm2_timer_driver])]
+    #[task(priority = 2, shared = [ingress])]
+    fn at_digest(mut cx: at_digest::Context) {
+        cx.shared.ingress.lock(|ingress| {
+            ingress.digest();
+        });
+
+        at_digest::spawn_after(10.millis()).unwrap();
+    }
+
+    #[task(priority = 3, binds = PWM_IRQ_WRAP, local = [pwm1_timer_driver, pwm2_timer_driver])]
     fn pwm_wrap(ctx: pwm_wrap::Context) {
         ctx.local.pwm1_timer_driver.on_wrap();
         ctx.local.pwm2_timer_driver.on_wrap();
