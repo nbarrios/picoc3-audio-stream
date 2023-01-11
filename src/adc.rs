@@ -1,8 +1,12 @@
 use crate::bsp::hal::pac::{ADC, DMA, RESETS};
-use defmt::info;
+use picoc3_audio_stream::audio_packet::AudioPacket;
 use rp2040_hal::dma::DREQ_ADC;
 
 pub static mut ADC_BUFFER: [u16; 512] = [1; 512];
+pub static mut AUDIO_PACKET_ONE: AudioPacket = AudioPacket {
+    magic: *b"ADC",
+    values: [0; 480],
+};
 
 pub struct DmaAdc {
     adc: ADC,
@@ -30,7 +34,7 @@ impl DmaAdc {
             .ch_read_addr
             .write(|w| unsafe { w.bits(adc.fifo.as_ptr() as u32) });
 
-        let dest: *const [u16; 512] = unsafe { &ADC_BUFFER };
+        let dest: *const [u16; 480] = unsafe { &AUDIO_PACKET_ONE.values };
         let dest_addr = dest as usize;
 
         // Set DMA0 write addr to ADC_BUFFER addr
@@ -40,9 +44,7 @@ impl DmaAdc {
 
         //DMA0 Config
         //Max Transfer Count
-        dma.ch[0]
-            .ch_trans_count
-            .write(|w| unsafe { w.bits(0xFFFFFFFF) });
+        dma.ch[0].ch_trans_count.write(|w| unsafe { w.bits(480) });
 
         dma.ch[0].ch_ctrl_trig.write(|w| unsafe {
             w.treq_sel()
@@ -54,10 +56,13 @@ impl DmaAdc {
                 .ring_sel()
                 .set_bit() // Wrap write addr
                 .ring_size()
-                .bits(3) // Wrap at 1024 bytes
+                .bits(10) // Wrap at 1024 bytes
                 .en()
                 .set_bit() //Enable DMA
         });
+
+        //Enable DMA_IRQ_0 for channel 0
+        dma.inte0.write(|w| unsafe { w.inte0().bits(1 << 0) });
 
         // Enable ADC
         adc.cs.write(|w| w.en().set_bit());
@@ -82,7 +87,23 @@ impl DmaAdc {
         Self { adc, dma }
     }
 
-    pub fn print_fifo_control_status(&self) {
+    pub fn buffer_value(&self) -> [u16; 4] {
+        let mut copy = [0u16; 4];
+        copy.copy_from_slice(unsafe { &ADC_BUFFER[0..4] });
+
+        copy
+    }
+
+    pub fn clear_interrupt(&self) {
+        self.dma.ints0.write(|w| unsafe { w.ints0().bits(1 << 0) });
+    }
+
+    pub fn debug_latest_result(&self) -> u16 {
+        let result: u16 = self.adc.result.read().result().bits();
+        result
+    }
+
+    pub fn debug_print_fifo_control_status(&self) {
         let adc_fifo_control_status = self.adc.fcs.read().bits();
         defmt::info!(
             "ADC FIFO CS: EN {0=0..1} SHIFT {0=1..2} ERR {0=2..3} DREQ_EN {0=3..4} EMPTY {0=8..9} FULL {0=9..10} \
@@ -91,7 +112,7 @@ impl DmaAdc {
         );
     }
 
-    pub fn print_dma_control_status(&self) {
+    pub fn debug_print_dma_control_status(&self) {
         let dma_control_status = self.dma.ch[0].ch_ctrl_trig.read().bits();
         defmt::info!(
             "DMA CS: EN {0=0..1} H_PRIO {0=1..2} DATA_SIZE {0=2..4} INCR_READ {0=4..5} INCR_WRITE {0=5..6} \
@@ -102,23 +123,11 @@ impl DmaAdc {
         );
     }
 
-    pub fn latest_result(&self) -> u16 {
-        let result: u16 = self.adc.result.read().result().bits();
-        result
-    }
-
-    pub fn dma_write_address(&self) -> u32 {
+    pub fn debug_dma_write_address(&self) -> u32 {
         self.dma.ch[0].ch_write_addr.read().bits()
     }
 
-    pub fn fifo_read(&self) -> u16 {
+    pub fn debug_fifo_read(&self) -> u16 {
         self.adc.fifo.read().val().bits()
-    }
-
-    pub fn buffer_value(&self) -> [u16; 4] {
-        let mut copy = [0u16; 4];
-        copy.copy_from_slice(unsafe { &ADC_BUFFER[0..4] });
-
-        copy
     }
 }

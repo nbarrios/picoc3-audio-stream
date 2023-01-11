@@ -14,6 +14,7 @@ mod adc;
 mod app {
     use crate::bsp::hal;
     use crate::adc;
+    use picoc3_audio_stream::audio_packet::AudioPacket;
     use esp_at_nal::wifi::JoinError;
     use rp2040_pwm_timer::{ExtDrivenTimer, PwmTimerDriver};
     use core::convert::TryInto;
@@ -42,7 +43,7 @@ mod app {
         clocks::{init_clocks_and_plls, Clock},
         gpio,
         gpio::pin::bank0::{Gpio0, Gpio1, Gpio2, Gpio3, Gpio4, Gpio5, Gpio8, Gpio9, Gpio10, Gpio11, Gpio12, Gpio13},
-        gpio::{Output, Input, Pin, PullDown, PushPull, Floating},
+        gpio::{Output, Pin, PullDown, PushPull},
         gpio::{Disabled, Function, Uart},
         pac::{self, UART1},
         pwm::{Slices, Pwm6, Pwm7},
@@ -73,7 +74,7 @@ mod app {
     type Uart0Pins = (Pin<Gpio12, Function<Uart>>, Pin<Gpio13, Function<Uart>>);
     type Uart1Pins = (Pin<Gpio8, Function<Uart>>, Pin<Gpio9, Function<Uart>>, Pin<Gpio10, Function<Uart>>, Pin<Gpio11, Function<Uart>>);
 
-    const TX_BUFFER_BYTES: usize = 1024;
+    const TX_BUFFER_BYTES: usize = 1536;
     const RX_BUFFER_BYTES: usize = 2048;
     const RES_CAPACITY_BYTES: usize = RX_BUFFER_BYTES;
     const URC_CAPACITY_BYTES: usize = RX_BUFFER_BYTES * 3;
@@ -95,14 +96,13 @@ mod app {
         >,
         #[lock_free]
         socket: Option<Socket>,
+        adc: adc::DmaAdc,
     }
 
     #[local]
     struct Local {
         display: ST7789<SPIIntType, Pin<Gpio0, Output<PushPull>>, Pin<Gpio4, Output<PushPull>>>,
         esp32_uart_rx: Reader<UART1, Uart1Pins>,
-        adc: adc::DmaAdc,
-        //adc_pin_1: Pin<Gpio27, Input<Floating>>,
         pwm1_timer_driver: PwmTimerDriver<'static, Pwm6>,
         pwm2_timer_driver: PwmTimerDriver<'static, Pwm7>,
     }
@@ -163,7 +163,7 @@ mod app {
         );
         let mut uart1 = UartPeripheral::new(cx.device.UART1, uart_pins, &mut resets)
             .enable(
-                UartConfig::new(1_000_000.Hz(), DataBits::Eight, None, StopBits::One),
+                UartConfig::new(2_000_000.Hz(), DataBits::Eight, None, StopBits::One),
                 clocks.peripheral_clock.freq()
             ).unwrap();
         uart1.enable_rx_interrupt();
@@ -227,12 +227,11 @@ mod app {
                 uart0,
                 adapter,
                 socket: None,
+                adc,
             },
             Local {
                 display,
                 esp32_uart_rx: rx,
-                adc,
-                //adc_pin_1,
                 pwm1_timer_driver,
                 pwm2_timer_driver,
             },
@@ -313,27 +312,18 @@ mod app {
         }
     }
 
-    #[task(shared = [uart0, adapter, socket], local = [adc])]
+    #[task(shared = [uart0, adapter, socket, adc])]
     fn read_adc(cx: read_adc::Context) {
-        //cx.local.adc.print_dma_control_status();
+        let len = minicbor::len(unsafe { &adc::AUDIO_PACKET_ONE });
+        let mut buffer = [0u8; 1024];
 
-        let adc_count = cx.local.adc.buffer_value();
-
-        let mut buffer = [0u8; 128];
-        let packet = picoc3_audio_stream::audio_packet::AudioPacket {
-            magic: *b"ADC",
-            values: adc_count
-        };
-
-        let len = minicbor::len(&packet);
-
-        minicbor::encode(&packet, buffer[..len].as_mut()).unwrap();
+        minicbor::encode(unsafe { &adc::AUDIO_PACKET_ONE }, buffer[..len].as_mut()).unwrap();
 
         if let Err(_e) = cx.shared.adapter.send(cx.shared.socket.as_mut().unwrap(), &buffer[..len]) {
             info!("Send failed");
         }
 
-        read_adc::spawn_at(monotonics::now() + 100_u64.millis()).unwrap();
+        read_adc::spawn_at(monotonics::now() + 10_u64.millis()).unwrap();
     }
 
     #[task(local = [display,
@@ -414,6 +404,15 @@ mod app {
     fn pwm_wrap(ctx: pwm_wrap::Context) {
         ctx.local.pwm1_timer_driver.on_wrap();
         ctx.local.pwm2_timer_driver.on_wrap();
+    }
+
+    #[task(priority = 3, binds = DMA_IRQ_0, shared = [adc])]
+    fn dma_irq_0(ctx: dma_irq_0::Context) {
+        let mut adc = ctx.shared.adc;
+        info!("DMA Transfer complete!");
+        adc.lock(|adc| {
+            adc.clear_interrupt();
+        });
     }
 
     fn tft_display_setup(
