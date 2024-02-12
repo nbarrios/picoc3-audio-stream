@@ -166,6 +166,7 @@ mod app {
                 UartConfig::new(2_000_000.Hz(), DataBits::Eight, None, StopBits::One),
                 clocks.peripheral_clock.freq()
             ).unwrap();
+        uart1.set_fifos(true);
         uart1.enable_rx_interrupt();
         let (rx, tx) = uart1.split();
 
